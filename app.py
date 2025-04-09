@@ -16,6 +16,8 @@ import os
 import psycopg2
 import openai
 import json
+from decimal import Decimal
+
 app = Flask(__name__)
 CORS(app)  
 DATABASE_URL = os.getenv("DATABASE_URL","")
@@ -70,6 +72,10 @@ def update_user_job():
     user.salary = salary
     user.rent = rent
 
+
+
+    user.account_balance=float(salary) - float(rent)
+    print('us',user.account_balance)
     # Initialize AccountLog if not exists
     existing_log = AccountLog.query.filter_by(user_id=user_id).first()
     if not existing_log:
@@ -90,10 +96,12 @@ def update_account_balances():
     users = User.query.all()
     for user in users:
         log = AccountLog.query.filter_by(user_id=user.id).first()
+        us=User.query.filter_by(user_id=user.id).first()
         if log:
             net_gain = float(user.salary or 0) - float(user.rent or 0)
             log.balance += net_gain
             log.last_updated = datetime.now(timezone.utc)
+            us.account_balance+=net_gain
     db.session.commit()
     print("Balances updated.")
 
@@ -172,6 +180,227 @@ class UserCurrentProgress(db.Model):
     current_chapter_id = db.Column(db.Integer, db.ForeignKey('chapter.chapter_id'), nullable=False)
     current_lesson_id = db.Column(db.Integer, db.ForeignKey('lesson.lesson_id'), nullable=False)
 
+class Stockbought(db.Model):
+    sb_id=db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.user_id'), nullable=False)
+    qre=db.Column(db.Numeric(10, 2), nullable=False)
+    qta=db.Column(db.Numeric(10, 2), nullable=False)
+    qtc=db.Column(db.Numeric(10, 2), nullable=False)
+    qin=db.Column(db.Numeric(10, 2), nullable=False)
+    qhd=db.Column(db.Numeric(10, 2), nullable=False)
+    avgre=db.Column(db.Numeric(10, 2), nullable=False)
+    avgta=db.Column(db.Numeric(10, 2), nullable=False)
+    avgtc=db.Column(db.Numeric(10, 2), nullable=False)
+    avgin=db.Column(db.Numeric(10, 2), nullable=False)
+    avghd=db.Column(db.Numeric(10, 2), nullable=False)
+
+
+@app.route('/fetch_balance', methods=['GET'])
+def fetch_balance():
+    user_id = request.args.get('user_id', type=int)
+    if not user_id:
+        return jsonify({'error': 'User ID is required'}), 400
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    return jsonify({
+        'account_balance': float(user.account_balance)
+    }), 200
+
+
+@app.route('/buy_stock', methods=['POST'])
+def buy_stock():
+    data = request.json
+    print(data)
+
+    ticker = data.get('ticker')
+    try:
+        price = Decimal(str(data.get('stockprice')))
+        quantity = Decimal(str(data.get('quantity')))
+        user_id = int(data.get('user_id'))
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid data format'}), 400
+
+    if not all([ticker, price, quantity, user_id]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    # Map tickers to table fields
+    ticker_map = {
+        'RELIANCE.NS': ('qre', 'avgre'),
+        'TATAPOWER.NS': ('qta', 'avgta'),
+        'TCS.NS': ('qtc', 'avgtc'),
+        'INFY.NS': ('qin', 'avgin'),
+        'HDFCBANK.NS': ('qhd', 'avghd'),
+    }
+
+    if ticker not in ticker_map:
+        return jsonify({'error': 'Invalid ticker'}), 400
+
+    qty_field, avg_field = ticker_map[ticker]
+
+    # Fetch stock entry or create new with 0s
+    stock_entry = Stockbought.query.filter_by(user_id=user_id).first()
+    if not stock_entry:
+        stock_entry = Stockbought(
+            user_id=user_id,
+            qre=Decimal('0.00'), qta=Decimal('0.00'), qtc=Decimal('0.00'),
+            qin=Decimal('0.00'), qhd=Decimal('0.00'),
+            avgre=Decimal('0.00'), avgta=Decimal('0.00'), avgtc=Decimal('0.00'),
+            avgin=Decimal('0.00'), avghd=Decimal('0.00')
+        )
+        db.session.add(stock_entry)
+        # db.session.flush()  # Register it with the session
+
+    # Fetch user entry
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    total_cost = price * quantity
+
+    if user.account_balance < total_cost:
+        return jsonify({'error': 'Insufficient account balance'}), 400
+
+    user.account_balance -= total_cost
+
+    current_qty = getattr(stock_entry, qty_field)
+    current_avg = getattr(stock_entry, avg_field)
+
+    new_qty = current_qty + quantity
+    new_avg = ((current_avg * current_qty) + (price * quantity)) / new_qty if new_qty != 0 else price
+
+    setattr(stock_entry, qty_field, new_qty)
+    setattr(stock_entry, avg_field, new_avg.quantize(Decimal('0.01')))  # rounding to 2 decimal places
+
+    try:
+        db.session.commit()
+        return jsonify({
+            'message': f'Successfully bought {quantity} of {ticker}',
+            'new_quantity': float(new_qty),
+            'new_average_price': float(new_avg),
+            'remaining_balance': float(user.account_balance)
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/qua_stock', methods=['POST'])
+def qua_stock():
+    data=request.json
+    user_id = int(data.get('user_id'))
+    ticker=data.get('selectedTicker')
+    print('uuuu',user_id,ticker)
+    ticker_map = {
+        'RELIANCE.NS': ('qre', 'avgre'),
+        'TATAPOWER.NS': ('qta', 'avgta'),
+        'TCS.NS': ('qtc', 'avgtc'),
+        'INFY.NS': ('qin', 'avgin'),
+        'HDFCBANK.NS': ('qhd', 'avghd'),
+    }
+
+    if ticker not in ticker_map:
+        return jsonify({'error': 'Invalid ticker'}), 400
+    
+    qty_field, avg_field = ticker_map[ticker]
+    stock = Stockbought.query.filter_by(user_id=user_id).first()
+    if not stock:
+        return jsonify({'error': 'User not found'}), 404
+
+    # Dynamically get the field values
+    qty_value = getattr(stock, qty_field)
+    avg_value = getattr(stock, avg_field)
+
+    return jsonify({
+        'qty_value': float(qty_value),
+        'avg_value': float(avg_value)
+    })
+
+
+
+from decimal import Decimal  # add this at the top
+
+@app.route('/sell_stock', methods=['POST'])
+def sell_stock():
+    data = request.json
+    ticker = data.get('ticker', '').strip().upper()
+    price = data.get('stockprice')
+    quantity = data.get('quantity')
+    user_id = data.get('user_id')
+
+    if not all([ticker, price, quantity, user_id]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    try:
+        price = float(price)
+        quantity = float(quantity)
+        user_id = int(user_id)
+    except ValueError:
+        return jsonify({'error': 'Invalid numeric values'}), 400
+
+    ticker_map = {
+        'RELIANCE.NS': ('qre', 'avgre'),
+        'TATAPOWER.NS': ('qta', 'avgta'),
+        'TCS.NS': ('qtc', 'avgtc'),
+        'INFY.NS': ('qin', 'avgin'),
+        'HDFCBANK.NS': ('qhd', 'avghd'),
+    }
+
+    if ticker not in ticker_map:
+        return jsonify({'error': 'Invalid ticker'}), 400
+
+    qty_field, avg_field = ticker_map[ticker]
+
+    stock_entry = Stockbought.query.filter_by(user_id=user_id).first()
+    if not stock_entry:
+        return jsonify({'error': 'Stock entry not found for user'}), 404
+
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    current_qty = float(getattr(stock_entry, qty_field, 0))
+    avg_price = float(getattr(stock_entry, avg_field, 0))
+
+    if quantity > current_qty:
+        return jsonify({'error': f'Not enough {ticker} stocks to sell'}), 400
+
+    new_qty = current_qty - quantity
+    setattr(stock_entry, qty_field, new_qty)
+
+    if new_qty == 0:
+        setattr(stock_entry, avg_field, 0)
+
+    # ✅ Convert to Decimal before adding
+    total_sale_value = Decimal(str(price * quantity))
+    profit=price-avg_price
+    print('aaaaa',price,avg_price,profit)
+    xp=0
+    if(profit>1000):
+        xp+=50
+    elif(profit>100):
+        xp+=30
+    elif(profit>0):
+        xp+=10
+    user.experience_points +=xp
+    user.account_balance += total_sale_value
+
+    try:
+        db.session.commit()
+        return jsonify({
+            'message': f'Successfully sold {quantity} of {ticker}',
+            'remaining_quantity': new_qty,
+            'average_price': avg_price if new_qty > 0 else 0,
+            'new_account_balance': float(user.account_balance),
+            'xp': xp
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
 
 @app.route('/add_lesson', methods=['POST'])
 def add_lesson():
@@ -192,7 +421,7 @@ def add_lesson():
 
 import google.generativeai as genai
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY","")
 genai.configure(api_key=GEMINI_API_KEY)
 
 
@@ -363,6 +592,8 @@ def skip_to_next_chapter(user_id):
     
     progress.current_chapter_id = next_chapter.chapter_id
     progress.current_lesson_id = first_lesson.lesson_id
+    user = User.query.get(user_id)
+    user.experience_points+=20
     db.session.commit()
     
     return jsonify({
